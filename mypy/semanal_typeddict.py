@@ -1,12 +1,13 @@
 """Semantic analysis of TypedDict definitions."""
 
+from mypy.expandtype import expand_type
 from mypy.ordered_dict import OrderedDict
 from typing import Optional, List, Set, Tuple
 from typing_extensions import Final
 
 from mypy.types import Type, AnyType, TypeOfAny, TypedDictType, TPDICT_NAMES
 from mypy.nodes import (
-    CallExpr, TypedDictExpr, Expression, NameExpr, Context, StrExpr, BytesExpr, UnicodeExpr,
+    CallExpr, IndexExpr, TypedDictExpr, Expression, NameExpr, Context, StrExpr, BytesExpr, UnicodeExpr,
     ClassDef, RefExpr, TypeInfo, AssignmentStmt, PassStmt, ExpressionStmt, EllipsisExpr, TempNode,
     DictExpr, ARG_POS, ARG_NAMED
 )
@@ -52,6 +53,11 @@ class TypedDictAnalyzer:
                 self.api.accept(base_expr)
                 if base_expr.fullname in TPDICT_NAMES or self.is_typeddict(base_expr):
                     possible = True
+            elif isinstance(base_expr, IndexExpr) and isinstance(base_expr.base, RefExpr):        
+                if self.is_typeddict(base_expr.base):
+                    self.api.accept(base_expr)
+                    possible = True
+            
         if possible:
             if (len(defn.base_type_exprs) == 1 and
                     isinstance(defn.base_type_exprs[0], RefExpr) and
@@ -61,15 +67,22 @@ class TypedDictAnalyzer:
                 if fields is None:
                     return True, None  # Defer
                 info = self.build_typeddict_typeinfo(defn.name, fields, types, required_keys)
+                info.type_vars = [tvar.name for tvar in defn.type_vars]
                 defn.analyzed = TypedDictExpr(info)
                 defn.analyzed.line = defn.line
                 defn.analyzed.column = defn.column
                 return True, info
+
             # Extending/merging existing TypedDicts
-            if any(not isinstance(expr, RefExpr) or
-                   expr.fullname not in TPDICT_NAMES and
-                   not self.is_typeddict(expr) for expr in defn.base_type_exprs):
+            if any(not (isinstance(expr, RefExpr) 
+                        and expr.fullname in TPDICT_NAMES 
+                        or self.is_typeddict(expr)) 
+                   and not (isinstance(expr, IndexExpr) 
+                            and isinstance(expr.base, RefExpr) 
+                            and self.is_typeddict(expr.base))
+                   for expr in defn.base_type_exprs):
                 self.fail("All bases of a new TypedDict must be TypedDict types", defn)
+            
             typeddict_bases = list(filter(self.is_typeddict, defn.base_type_exprs))
             keys = []  # type: List[str]
             types = []
@@ -77,11 +90,20 @@ class TypedDictAnalyzer:
 
             # Iterate over bases in reverse order so that leftmost base class' keys take precedence
             for base in reversed(typeddict_bases):
-                assert isinstance(base, RefExpr)
-                assert isinstance(base.node, TypeInfo)
-                assert isinstance(base.node.typeddict_type, TypedDictType)
-                base_typed_dict = base.node.typeddict_type
-                base_items = base_typed_dict.items
+                if isinstance(base, IndexExpr):
+                    type_args = self.api.analyze_type_application_args(base)
+                    base_node = base.base.node
+                    variables = {
+                        binder.id: arg
+                        for binder, arg in zip(base_node.defn.type_vars, type_args)
+                    }
+                    base_typeddict = expand_type(base_node.typeddict_type, variables)
+                else:
+                    base_typeddict = base.node.typeddict_type
+
+                assert isinstance(base_typeddict, TypedDictType)
+
+                base_items = base_typeddict.items
                 valid_items = base_items.copy()
                 for key in base_items:
                     if key in keys:
@@ -89,7 +111,7 @@ class TypedDictAnalyzer:
                                   .format(key), defn)
                 keys.extend(valid_items.keys())
                 types.extend(valid_items.values())
-                required_keys.update(base_typed_dict.required_keys)
+                required_keys.update(base_typeddict.required_keys)
             new_keys, new_types, new_required_keys = self.analyze_typeddict_classdef_fields(defn,
                                                                                             keys)
             if new_keys is None:
@@ -98,10 +120,12 @@ class TypedDictAnalyzer:
             types.extend(new_types)
             required_keys.update(new_required_keys)
             info = self.build_typeddict_typeinfo(defn.name, keys, types, required_keys)
+            info.type_vars = [tvar.name for tvar in defn.type_vars]
             defn.analyzed = TypedDictExpr(info)
             defn.analyzed.line = defn.line
             defn.analyzed.column = defn.column
             return True, info
+            
         return False, None
 
     def analyze_typeddict_classdef_fields(
@@ -320,7 +344,7 @@ class TypedDictAnalyzer:
 
     def is_typeddict(self, expr: Expression) -> bool:
         return (isinstance(expr, RefExpr) and isinstance(expr.node, TypeInfo) and
-                expr.node.typeddict_type is not None)
+                expr.node.typeddict_type is not None) or (isinstance(expr, IndexExpr) and self.is_typeddict(expr.base))
 
     def fail(self, msg: str, ctx: Context, *, code: Optional[ErrorCode] = None) -> None:
         self.api.fail(msg, ctx, code=code)

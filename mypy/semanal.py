@@ -1068,6 +1068,7 @@ class SemanticAnalyzer(NodeVisitor[None],
         bases = defn.base_type_exprs
         bases, tvar_defs, is_protocol = self.clean_up_bases_and_infer_type_variables(defn, bases,
                                                                                      context=defn)
+        defn.type_vars = tvar_defs
 
         for tvd in tvar_defs:
             if any(has_placeholder(t) for t in [tvd.upper_bound] + tvd.values):
@@ -1110,8 +1111,7 @@ class SemanticAnalyzer(NodeVisitor[None],
         # Create TypeInfo for class now that base classes and the MRO can be calculated.
         self.prepare_class_def(defn)
 
-        defn.type_vars = tvar_defs
-        defn.info.type_vars = [tvar.name for tvar in tvar_defs]
+        defn.info.type_vars = [tvar.name for tvar in defn.type_vars]
         if base_error:
             defn.info.fallback_to_any = True
 
